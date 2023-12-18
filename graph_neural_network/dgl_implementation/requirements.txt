@@ -1,4 +1,4 @@
-git+https://github.com/NVIDIA/dllogger@26a0f8f1958de2c0c460925ff6102a4d2486d6cc
+git+https://github.com/NVIDIA/dllogger#egg=dllogger
 
 # For PyG:
 # torch_geometric
