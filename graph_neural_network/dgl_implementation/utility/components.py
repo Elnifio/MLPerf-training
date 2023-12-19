@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from utility.pyg_sampler import PyGSampler
 
@@ -112,6 +113,35 @@ def get_loader(graph, index, fanouts, backend, use_pyg_sampler=True, **kwargs):
         assert False, "Unrecognized backend " + backend
 
 
+def glorot(value):
+    if isinstance(value, torch.Tensor):
+        stdv = math.sqrt(6.0 / (value.size(-2) + value.size(-1)))
+        value.data.uniform_(-stdv, stdv)
+    else:
+        for v in value.parameters() if hasattr(value, 'parameters') else []:
+            glorot(v)
+        for v in value.buffers() if hasattr(value, 'buffers') else []:
+            glorot(v)
+
+
+class GATPatched(dgl.nn.pytorch.GATConv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def reset_parameters(self):
+        if hasattr(self, 'fc'):
+            glorot(self.fc.weight)
+        else:
+            glorot(self.fc_src.weight)
+            glorot(self.fc_dst.weight)
+        glorot(self.attn_l)
+        glorot(self.attn_r)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, 0)
+        if isinstance(self.res_fc, nn.Linear):
+            glorot(self.res_fc.weight)
+
+
 class RGAT_DGL(nn.Module):
     def __init__(
             self, 
@@ -124,16 +154,16 @@ class RGAT_DGL(nn.Module):
 
         # does not support other models since they are not used
         self.layers.append(dgl.nn.pytorch.HeteroGraphConv({
-            etype: dgl.nn.pytorch.GATConv(in_feats, h_feats // n_heads, n_heads)
+            etype: GATPatched(in_feats, h_feats // n_heads, n_heads)
             for etype in etypes}))
         
         for _ in range(num_layers-2):
             self.layers.append(dgl.nn.pytorch.HeteroGraphConv({
-                etype: dgl.nn.pytorch.GATConv(h_feats, h_feats // n_heads, n_heads)
+                etype: GATPatched(h_feats, h_feats // n_heads, n_heads)
                 for etype in etypes}))
 
         self.layers.append(dgl.nn.pytorch.HeteroGraphConv({
-            etype: dgl.nn.pytorch.GATConv(h_feats, h_feats // n_heads, n_heads)
+            etype: GATPatched(h_feats, h_feats // n_heads, n_heads)
             for etype in etypes}))
         self.dropout = nn.Dropout(dropout)
         self.linear = nn.Linear(h_feats, num_classes)
