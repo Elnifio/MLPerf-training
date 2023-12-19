@@ -22,12 +22,14 @@ warnings.filterwarnings("ignore")
 PAPER="paper" # we don't have any other labels to predict
 
 
-def evaluate(dataloader, model, feature_store, device):
+def evaluate(dataloader, model, feature_store, device, eval_batches):
     epoch_start = time.time()
     predictions = []
     labels = []
     with torch.no_grad():
         for batch in dataloader:
+            if eval_batches > 0 and len(predictions) > eval_batches:
+                break
 
             batch_preds, batch_labels = model(batch, device, feature_store)
 
@@ -45,11 +47,11 @@ def run(
         graph, num_classes, in_memory, hp_config,
         modelpath, model_save, 
         fan_out, batch_size, num_workers, use_uva,
-        hidden_channels, num_heads, dropout,
-        learning_rate, decay, sched_stepsize, sched_gamma,
+        hidden_channels, num_heads, 
+        learning_rate, 
         epochs,
         train_idx, val_idx, 
-        add_timer, no_debug, eval_frequency,
+        add_timer, no_debug, eval_frequency, in_epoch_eval_fraction,
         feature_store):
 
     logger = IntegratedLogger(0, add_timer, no_debug=no_debug, print_only=True)
@@ -118,6 +120,8 @@ def run(
         ddp_seed=SEED
     )
 
+    num_eval_batches = int(len(val_dataloader) * in_epoch_eval_fraction) + 1
+
     if feature_store is not None and not in_memory:
         # if we use memory-mapped feature,
         # then we need to build the feature here
@@ -137,8 +141,7 @@ def run(
         h_feats=hidden_channels,
         num_classes=num_classes,
         num_layers=len(fan_out.split(",")),
-        n_heads=num_heads,
-        dropout=dropout
+        n_heads=num_heads
     ).to(device)
 
     logger.debug(f"     Initialized model has {len(model.layers)} layers.")
@@ -151,12 +154,9 @@ def run(
     loss_fcn = nn.CrossEntropyLoss().to(device)
     optimizer = optim.Adam(
         model.parameters(), 
-        lr=learning_rate, 
-        weight_decay=decay)
+        lr=learning_rate)
 
-    sched = optim.lr_scheduler.StepLR(optimizer, step_size=sched_stepsize, gamma=sched_gamma)
-
-    logger.debug(f"Model, optimizer, and scheduler initialized.")
+    logger.debug(f"Model and optimizer initialized.")
 
     if proc_id == 0:
         param_size = 0
@@ -203,7 +203,6 @@ def run(
         for step, batch in iterator:
             # in_epoch_eval_acc will have the same length as losses & train accs
             # this helps us correspond each in-epoch eval acc with the step
-            eval_acc_for_this_step = -1
             if step % 3000 == 0 and add_timer:
                 # for train time estimation
                 print(f"Rank {local_rank} reached step {step} at {datetime.datetime.now()}")
@@ -213,23 +212,25 @@ def run(
                 torch.distributed.barrier()
                 eval_start = time.time()
                 model.eval()
-                val_time, eval_acc_for_this_step = evaluate(
+                val_time, val_acc = evaluate(
                     dataloader = val_dataloader,
                     model=model,
                     feature_store=feature_store, 
-                    device=device
+                    device=device,
+                    eval_batches=num_eval_batches
                 )
+                eval_accs.append(val_acc)
                 eval_counter += 1
                 torch.cuda.synchronize()
                 torch.distributed.barrier()
                 print(
-                    f"Rank {local_rank}'s {eval_counter}-th eval before step {step}, at epoch {epoch}: {eval_acc_for_this_step}. "
+                    f"Rank {local_rank}'s {eval_counter}-th eval before step {step}, at epoch {epoch}: {val_acc}. "
                     +
                     (f"Eval time: {str(datetime.timedelta(seconds=int(time.time() - eval_start)))}" if add_timer else "")
                 )
                 model.train()
-
-            eval_accs.append(eval_acc_for_this_step)
+            else:
+                eval_accs.append(-1)
 
             batch_pred, batch_labels = model(batch, device, feature_store)
             batch_accuracy = sklearn.metrics.accuracy_score(batch_labels.cpu().numpy(), batch_pred.argmax(1).detach().cpu().numpy()).item()*100
@@ -249,7 +250,6 @@ def run(
         torch.distributed.barrier()
 
         # end of a training epoch
-        sched.step()        
         epoch_acc = sum(accs) / len(accs)
         epoch_gpu_mem = sum(gpu_mem_alloc) / len(gpu_mem_alloc)
 
@@ -273,7 +273,8 @@ def run(
             dataloader=val_dataloader,
             model=model,
             feature_store=feature_store,
-            device=device
+            device=device,
+            eval_batches=-1
         )
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -305,13 +306,13 @@ def run(
     # Export metrics for every rank
     metrics_dir="/results"
 
-    def path_formatter(sampler_style, dataset_size, rank):
+    def path_formatter(rank):
         trial_count = 0
-        while os.path.exists(f"{metrics_dir}/{sampler_style}-sampler-{dataset_size}_hidden_{hidden_channels}_attn_{num_heads}_fanout_{fan_out}_rank_{rank}_trial_{trial_count}.json"):
+        while os.path.exists(f"{metrics_dir}/rank_{rank}_trial_{trial_count}.json"):
             trial_count += 1
-        return f"{metrics_dir}/{sampler_style}-sampler-{dataset_size}_hidden_{hidden_channels}_attn_{num_heads}_fanout_{fan_out}_rank_{rank}_trial_{trial_count}.json"
+        return f"{metrics_dir}/rank_{rank}_trial_{trial_count}.json"
     
-    with open(path_formatter(("pyg" if use_pyg_sampler else "dgl"), feature_store.dataset_size, local_rank), "w") as f:
+    with open(path_formatter(local_rank), "w") as f:
         json.dump(collected_metrics, f)
 
 
@@ -347,17 +348,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--hidden_channels', type=int, default=128)
     parser.add_argument('--num_heads', type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument('--decay', type=float, default=0)
     parser.add_argument('--learning_rate', type=float, default=0.01)
     parser.add_argument('--epochs', type=int, default=3)
 
-    # not active
-    parser.add_argument("--sched_stepsize", type=int, default=25)
-    parser.add_argument("--sched_gamma", type=float, default=0.25)
-
     # Training and logs related
-    parser.add_argument('--in_epoch_eval_times', type=int, default=4)
+    parser.add_argument('--in_epoch_eval_times', type=int, default=10)
+    parser.add_argument('--in_epoch_eval_fraction', type=float, default=0.005)
     parser.add_argument('--gpu_devices', type=str, default='0,1,2,3,4,5,6,7')
 
     parser.add_argument("--add_timer", action="store_true")
@@ -439,10 +435,10 @@ if __name__ == '__main__':
         g, args.num_classes, args.in_memory, vars(args),
         args.modelpath, args.model_save,
         args.fan_out, args.batch_size, args.num_workers, args.use_uva,
-        args.hidden_channels, args.num_heads, args.dropout,
-        args.learning_rate, args.decay, args.sched_stepsize, args.sched_gamma,
+        args.hidden_channels, args.num_heads, 
+        args.learning_rate, 
         args.epochs,
         dataset.train_indices, dataset.val_indices,
-        args.add_timer, args.no_debug, args.in_epoch_eval_times,
+        args.add_timer, args.no_debug, args.in_epoch_eval_times, args.in_epoch_eval_fraction,
         feature_store
     ), nprocs=num_gpus)
