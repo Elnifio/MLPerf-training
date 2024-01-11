@@ -10,6 +10,8 @@ import time, tqdm, numpy as np
 from functools import partial
 import json
 
+import pickle
+
 from dllogger import Verbosity
 from utility.feature_fetching import Features, IGBHeteroGraphStructure
 from utility.components import build_graph, get_loader, RGAT
@@ -26,20 +28,26 @@ def evaluate(dataloader, model, feature_store, device, eval_batches):
     epoch_start = time.time()
     predictions = []
     labels = []
+    target_ids = []
     with torch.no_grad():
         for batch in dataloader:
             if eval_batches > 0 and len(predictions) > eval_batches:
                 break
 
             batch_preds, batch_labels = model(batch, device, feature_store)
+            if len(predictions) == 0:
+                print(f"Rank 0 first 25 batch labels: {batch_labels[:25]}")
 
             labels.append(batch_labels.cpu().numpy())
             predictions.append(batch_preds.argmax(1).cpu().numpy())
 
+            target_ids.append(batch[-1][-1].dstdata[dgl.NID]['paper'].cpu().numpy())
+
         predictions = np.concatenate(predictions)
         labels = np.concatenate(labels)
+        target_ids = np.concatenate(target_ids)
         accuracy = sklearn.metrics.accuracy_score(labels, predictions) * 100
-    return time.time() - epoch_start, accuracy
+    return time.time() - epoch_start, accuracy, (predictions, labels, target_ids)
 
 
 def run(
@@ -51,7 +59,8 @@ def run(
         learning_rate, 
         epochs,
         train_idx, val_idx, 
-        add_timer, no_debug, eval_frequency, in_epoch_eval_fraction,
+        add_timer, no_debug, 
+        validation_frac_within_epoch, in_epoch_eval_fraction, early_stop, target_accuracy,
         feature_store):
 
     logger = IntegratedLogger(0, add_timer, no_debug=no_debug, print_only=True)
@@ -77,6 +86,8 @@ def run(
     logger.debug(f"Train val test data got. Initializing train dataloader through dgl.dataloading.DataLoader.")
     train_indices = train_idx
     val_indices = val_idx
+    # train_indices = train_idx.split(train_idx.size(0) // world_size)[proc_id]
+    # val_indices = val_idx.split(val_idx.size(0) // world_size)[proc_id]
 
     if use_uva: 
         train_indices = train_indices.to(device)
@@ -93,17 +104,14 @@ def run(
         device=device,
         num_workers=num_workers,
         use_uva=use_uva, 
-        use_ddp=True, 
+        use_ddp=True,
         ddp_seed=SEED
     )
 
     num_batches = len(train_dataloader)
-    do_interval_eval = eval_frequency > 0
-    if do_interval_eval:
-        eval_interval = num_batches // eval_frequency + 1
-        print(f"    [Rank {local_rank}] Total length of train dataloader: {len(train_dataloader)}; evaluating every {eval_interval} steps;")
-    else:
-        eval_interval = -1
+    validation_freq = int(num_batches * validation_frac_within_epoch)
+
+    is_success = False
 
     val_dataloader = get_loader(
         graph=graph, 
@@ -112,15 +120,15 @@ def run(
         backend=backend,
         use_pyg_sampler=use_pyg_sampler,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         device=device,
         num_workers=num_workers,
         use_uva=use_uva,
-        use_ddp=True, 
+        use_ddp=True,
         ddp_seed=SEED
     )
 
-    num_eval_batches = int(len(val_dataloader) * in_epoch_eval_fraction) + 1
+    num_eval_batches = int(len(val_dataloader) * in_epoch_eval_fraction)
 
     if feature_store is not None and not in_memory:
         # if we use memory-mapped feature,
@@ -176,8 +184,7 @@ def run(
     logger.metadata("train_loss", {"unit": "", "format": ":.4f"})
     logger.metadata("train_acc", {"unit": "%", "format": ":.2f"})
     logger.metadata("valid_acc", {"unit": "%", "format": ":.2f"})
-    logger.metadata("test__acc", {"unit": "%", "format": ":.2f"})
-    logger.metadata("best_valid_acc", {"unit": "%", "format": ":.2f"})
+    logger.metadata("rank_valid_acc", {"unit": "%", "format": ":.2f"})
 
     # Training loop
     collected_metrics = []
@@ -203,34 +210,6 @@ def run(
         for step, batch in iterator:
             # in_epoch_eval_acc will have the same length as losses & train accs
             # this helps us correspond each in-epoch eval acc with the step
-            if step % 3000 == 0 and add_timer:
-                # for train time estimation
-                print(f"Rank {local_rank} reached step {step} at {datetime.datetime.now()}")
-
-            if do_interval_eval and step % eval_interval == 0:
-                torch.cuda.synchronize()
-                torch.distributed.barrier()
-                eval_start = time.time()
-                model.eval()
-                val_time, val_acc = evaluate(
-                    dataloader = val_dataloader,
-                    model=model,
-                    feature_store=feature_store, 
-                    device=device,
-                    eval_batches=num_eval_batches
-                )
-                eval_accs.append(val_acc)
-                eval_counter += 1
-                torch.cuda.synchronize()
-                torch.distributed.barrier()
-                print(
-                    f"Rank {local_rank}'s {eval_counter}-th eval before step {step}, at epoch {epoch}: {val_acc}. "
-                    +
-                    (f"Eval time: {str(datetime.timedelta(seconds=int(time.time() - eval_start)))}" if add_timer else "")
-                )
-                model.train()
-            else:
-                eval_accs.append(-1)
 
             batch_pred, batch_labels = model(batch, device, feature_store)
             batch_accuracy = sklearn.metrics.accuracy_score(batch_labels.cpu().numpy(), batch_pred.argmax(1).detach().cpu().numpy()).item()*100
@@ -240,6 +219,43 @@ def run(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            if (step+1) % validation_freq == 0:
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                eval_start = time.time()
+                model.eval()
+                all_reduced_val_acc = torch.tensor([0., ]).to(device)
+                val_time, val_acc, validation_results = evaluate(
+                    dataloader = val_dataloader,
+                    model=model,
+                    feature_store=feature_store, 
+                    device=device,
+                    eval_batches=num_eval_batches
+                )
+                eval_accs.append(val_acc)
+
+                all_reduced_val_acc += val_acc
+                torch.distributed.all_reduce(all_reduced_val_acc, op=torch.distributed.ReduceOp.SUM)
+                all_reduced_val_acc /= world_size
+                all_reduced_val_acc = all_reduced_val_acc.to("cpu").item()
+
+                eval_counter += 1
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+                print(
+                    f"Rank {local_rank}'s {eval_counter}-th eval before step {step}, at epoch {epoch}: {val_acc}. All reduced val acc: {all_reduced_val_acc}. "
+                    +
+                    (f"Eval time: {str(datetime.timedelta(seconds=int(time.time() - eval_start)))}" if add_timer else "")
+                )
+
+                model.train()
+
+                if early_stop and all_reduced_val_acc >= target_accuracy: 
+                    is_success = True
+                    break
+            else:
+                eval_accs.append(-1)
 
             epoch_loss += loss.detach().item()
             train_losses.append(loss.detach().item())
@@ -266,42 +282,64 @@ def run(
             verbosity=Verbosity.DEFAULT
         )
 
-        torch.cuda.synchronize()
-        torch.distributed.barrier()
-        model.eval()
-        val_time, val_acc = evaluate(
-            dataloader=val_dataloader,
-            model=model,
-            feature_store=feature_store,
-            device=device,
-            eval_batches=-1
-        )
-        torch.cuda.synchronize()
-        torch.distributed.barrier()
+        if early_stop and is_success: 
+            collected_metrics.append(
+                {
+                    "rank": local_rank,
+                    "epoch": epoch,
+                    "train_losses": train_losses,
+                    "train_accs": accs,
+                    "eval_accs": eval_accs,
+                    "val_acc": -1
+                }
+            )
+        else:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            model.eval()
+            all_reduced_val_acc = torch.tensor([0., ]).to(device)
 
-        logger.log(
-            step=(epoch, "valid"),
-            data={
-                "rank": local_rank,
-                "valid_acc": val_acc,
-                "valid_time": str(datetime.timedelta(seconds=int(val_time)))
-            },
-            verbosity=Verbosity.DEFAULT
-        )
+            val_time, val_acc, _ = evaluate(
+                dataloader=val_dataloader,
+                model=model,
+                feature_store=feature_store,
+                device=device,
+                eval_batches=num_eval_batches
+            )
 
-        if model_save:
-            torch.save(model.state_dict(), modelpath)
+            all_reduced_val_acc += val_acc
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
 
-        collected_metrics.append(
-            {
-                "rank": local_rank,
-                "epoch": epoch,
-                "train_losses": train_losses,
-                "train_accs": accs,
-                "eval_accs": eval_accs,
-                "val_acc": val_acc
-            }
-        )
+            torch.distributed.all_reduce(all_reduced_val_acc, op=torch.distributed.ReduceOp.SUM)
+            all_reduced_val_acc /= world_size
+            all_reduced_val_acc = all_reduced_val_acc.to("cpu").item()
+
+            logger.log(
+                step=(epoch, "valid"),
+                data={
+                    "rank": local_rank,
+                    "rank_valid_acc": val_acc,
+                    "valid_acc": all_reduced_val_acc, 
+                    "valid_time": str(datetime.timedelta(seconds=int(val_time)))
+                },
+                verbosity=Verbosity.DEFAULT
+            )
+
+            collected_metrics.append(
+                {
+                    "rank": local_rank,
+                    "epoch": epoch,
+                    "train_losses": train_losses,
+                    "train_accs": accs,
+                    "eval_accs": eval_accs,
+                    "val_acc": val_acc
+                }
+            )
+
+            if all_reduced_val_acc >= target_accuracy: 
+                is_success = True
+                break
 
     # Export metrics for every rank
     metrics_dir="/results"
@@ -314,6 +352,8 @@ def run(
     
     with open(path_formatter(local_rank), "w") as f:
         json.dump(collected_metrics, f)
+
+    print(f"Rank {local_rank} train status: {is_success}")
 
 
 if __name__ == '__main__':
@@ -352,8 +392,11 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=3)
 
     # Training and logs related
-    parser.add_argument('--in_epoch_eval_times', type=int, default=10)
-    parser.add_argument('--in_epoch_eval_fraction', type=float, default=0.005)
+    parser.add_argument('--validation_frac_within_epoch', type=float, default=0.2)
+    parser.add_argument('--in_epoch_eval_fraction', type=float, default=0.05)
+    parser.add_argument("--early_stop", action="store_true")
+    parser.add_argument("--target_accuracy", type=float, default=72.0)
+
     parser.add_argument('--gpu_devices', type=str, default='0,1,2,3,4,5,6,7')
 
     parser.add_argument("--add_timer", action="store_true")
@@ -439,6 +482,7 @@ if __name__ == '__main__':
         args.learning_rate, 
         args.epochs,
         dataset.train_indices, dataset.val_indices,
-        args.add_timer, args.no_debug, args.in_epoch_eval_times, args.in_epoch_eval_fraction,
+        args.add_timer, args.no_debug, 
+        args.validation_frac_within_epoch, args.in_epoch_eval_fraction, args.early_stop, args.target_accuracy,
         feature_store
     ), nprocs=num_gpus)
