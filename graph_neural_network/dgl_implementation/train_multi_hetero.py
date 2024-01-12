@@ -17,7 +17,6 @@ from utility.feature_fetching import Features, IGBHeteroGraphStructure
 from utility.components import build_graph, get_loader, RGAT
 from utility.logger import IntegratedLogger
 
-SEED = 0
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -56,7 +55,7 @@ def run(
         epochs,
         train_idx, val_idx, 
         add_timer, no_debug, 
-        validation_frac_within_epoch, early_stop, target_accuracy,
+        validation_frac_within_epoch, early_stop, target_accuracy, random_seed,
         feature_store):
 
     logger = IntegratedLogger(0, add_timer, no_debug=no_debug, print_only=True)
@@ -85,6 +84,10 @@ def run(
     # train_indices = train_idx.split(train_idx.size(0) // world_size)[proc_id]
     # val_indices = val_idx.split(val_idx.size(0) // world_size)[proc_id]
 
+    torch.manual_seed(random_seed)
+    dgl.seed(random_seed)
+    dgl.random.seed(random_seed)
+
     if use_uva: 
         train_indices = train_indices.to(device)
         val_indices = val_indices.to(device)
@@ -101,7 +104,7 @@ def run(
         num_workers=num_workers,
         use_uva=use_uva, 
         use_ddp=True,
-        ddp_seed=SEED
+        ddp_seed=random_seed
     )
 
     num_batches = len(train_dataloader)
@@ -121,7 +124,7 @@ def run(
         num_workers=num_workers,
         use_uva=use_uva,
         use_ddp=True,
-        ddp_seed=SEED
+        ddp_seed=random_seed
     )
 
     if feature_store is not None and not in_memory:
@@ -321,6 +324,7 @@ def run(
 
             collected_metrics.append(
                 {
+                    "seed": random_seed,
                     "rank": local_rank,
                     "epoch": epoch,
                     "train_losses": train_losses,
@@ -388,6 +392,8 @@ if __name__ == '__main__':
     parser.add_argument('--validation_frac_within_epoch', type=float, default=0.2)
     parser.add_argument("--continue_training", action="store_true")
     parser.add_argument("--target_accuracy", type=float, default=72.0)
+
+    parser.add_argument("--random_seed", type=int, default=0)
 
     parser.add_argument('--gpu_devices', type=str, default='0,1,2,3,4,5,6,7')
 
@@ -475,6 +481,6 @@ if __name__ == '__main__':
         args.epochs,
         dataset.train_indices, dataset.val_indices,
         args.add_timer, args.no_debug, 
-        args.validation_frac_within_epoch, not args.continue_training, args.target_accuracy,
+        args.validation_frac_within_epoch, not args.continue_training, args.target_accuracy, args.random_seed,
         feature_store
     ), nprocs=num_gpus)
