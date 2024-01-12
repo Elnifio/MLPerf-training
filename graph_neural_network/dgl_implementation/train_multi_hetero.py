@@ -226,7 +226,7 @@ def run(
                 eval_start = time.time()
                 model.eval()
                 all_reduced_val_acc = torch.tensor([0., ]).to(device)
-                val_time, val_acc, validation_results = evaluate(
+                val_time, val_acc, _ = evaluate(
                     dataloader = val_dataloader,
                     model=model,
                     feature_store=feature_store, 
