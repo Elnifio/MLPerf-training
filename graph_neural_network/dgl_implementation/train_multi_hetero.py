@@ -24,19 +24,15 @@ warnings.filterwarnings("ignore")
 PAPER="paper" # we don't have any other labels to predict
 
 
-def evaluate(dataloader, model, feature_store, device, eval_batches):
+def evaluate(dataloader, model, feature_store, device):
     epoch_start = time.time()
     predictions = []
     labels = []
     target_ids = []
     with torch.no_grad():
         for batch in dataloader:
-            if eval_batches > 0 and len(predictions) > eval_batches:
-                break
 
             batch_preds, batch_labels = model(batch, device, feature_store)
-            if len(predictions) == 0:
-                print(f"Rank 0 first 25 batch labels: {batch_labels[:25]}")
 
             labels.append(batch_labels.cpu().numpy())
             predictions.append(batch_preds.argmax(1).cpu().numpy())
@@ -60,7 +56,7 @@ def run(
         epochs,
         train_idx, val_idx, 
         add_timer, no_debug, 
-        validation_frac_within_epoch, in_epoch_eval_fraction, early_stop, target_accuracy,
+        validation_frac_within_epoch, early_stop, target_accuracy,
         feature_store):
 
     logger = IntegratedLogger(0, add_timer, no_debug=no_debug, print_only=True)
@@ -127,8 +123,6 @@ def run(
         use_ddp=True,
         ddp_seed=SEED
     )
-
-    num_eval_batches = int(len(val_dataloader) * in_epoch_eval_fraction)
 
     if feature_store is not None and not in_memory:
         # if we use memory-mapped feature,
@@ -230,8 +224,7 @@ def run(
                     dataloader = val_dataloader,
                     model=model,
                     feature_store=feature_store, 
-                    device=device,
-                    eval_batches=num_eval_batches
+                    device=device
                 )
                 eval_accs.append(val_acc)
 
@@ -304,7 +297,6 @@ def run(
                 model=model,
                 feature_store=feature_store,
                 device=device,
-                eval_batches=num_eval_batches
             )
 
             all_reduced_val_acc += val_acc
@@ -393,8 +385,7 @@ if __name__ == '__main__':
 
     # Training and logs related
     parser.add_argument('--validation_frac_within_epoch', type=float, default=0.2)
-    parser.add_argument('--in_epoch_eval_fraction', type=float, default=0.05)
-    parser.add_argument("--early_stop", action="store_true")
+    parser.add_argument("--continue_training", action="store_true")
     parser.add_argument("--target_accuracy", type=float, default=72.0)
 
     parser.add_argument('--gpu_devices', type=str, default='0,1,2,3,4,5,6,7')
@@ -483,6 +474,6 @@ if __name__ == '__main__':
         args.epochs,
         dataset.train_indices, dataset.val_indices,
         args.add_timer, args.no_debug, 
-        args.validation_frac_within_epoch, args.in_epoch_eval_fraction, args.early_stop, args.target_accuracy,
+        args.validation_frac_within_epoch, not args.continue_training, args.target_accuracy,
         feature_store
     ), nprocs=num_gpus)
