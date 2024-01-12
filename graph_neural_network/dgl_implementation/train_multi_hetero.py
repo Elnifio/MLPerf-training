@@ -286,6 +286,7 @@ def run(
                     "val_acc": -1
                 }
             )
+            break
         else:
             torch.cuda.synchronize()
             torch.distributed.barrier()
