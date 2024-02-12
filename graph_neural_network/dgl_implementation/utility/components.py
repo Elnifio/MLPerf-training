@@ -40,9 +40,7 @@ def check_glt_available():
 
 
 def check_pyg_available():
-    # TODO: support PyG backend
     assert PYG_AVAILABLE, "PyG not available in the container"
-    raise NotImplementedError()
 
 
 def build_graph(graph_structure, backend, features=None):
@@ -79,10 +77,22 @@ def build_graph(graph_structure, backend, features=None):
     elif backend.lower() == "glt":
         check_glt_available()
         raise NotImplementedError()
-
     elif backend.lower() == "pyg":
         check_pyg_available()
-        raise NotImplementedError()
+        data = pyg.HeteroData({k:torch.cat((v[0].reshape(1, -1), v[1].reshape(1, -1))) for k,v in graph_structure.edge_dict()})
+        predict_node_type = "paper"
+
+        if features is not None:
+
+            for node_type, node_feature in features.feature.items():
+                data[node_type].num_nodes = node_feature.size(0)
+                data[node_type].x = node_feature
+
+        data["cites"].edge_index = pyg.utils.remove_self_loops(data["cites"].edge_index)
+        data["cites"].edge_index = pyg.utils.add_self_loops(data["cites"].edge_index)
+        data["paper"].y = graph_structure.label
+    
+        return data       
     else:
         assert False, "Unrecognized backend " + backend
 
@@ -108,7 +118,8 @@ def get_loader(graph, index, fanouts, backend, use_pyg_sampler=True, **kwargs):
         raise NotImplementedError()
     elif backend.lower() == "pyg":
         check_pyg_available()
-        raise NotImplementedError()
+        fanouts = [int(fanout) for fanout in fanouts.split(",")]
+        return pyg.loader.NeighborLoader(graph, num_neighbors=fanouts, input_nodes=('paper', index), **kwargs)
     else:
         assert False, "Unrecognized backend " + backend
 
@@ -124,7 +135,7 @@ def glorot(value):
             glorot(v)
 
 
-class GATPatched(dgl.nn.pytorch.GATConv):
+class GATPatchedDGL(dgl.nn.pytorch.GATConv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -203,18 +214,56 @@ class RGAT_DGL(nn.Module):
         return batch_inputs, batch_labels
 
 
+class RGAT_PyG(nn.Module):
+    def __init__(
+            self, 
+            etypes, 
+            in_feats, h_feats, num_classes, 
+            num_layers=2, n_heads=4, dropout=0.2,
+            with_trim=None):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        
+        # does not support other models since they are not used
+        self.layers.append(pyg.nn.HeteroConv({
+            etype: pyg.nn.GATConv(in_feats, h_feats // n_heads, n_heads)
+            for etype in etypes}))
+        
+        for _ in range(num_layers-2):
+            self.layers.append(pyg.nn.HeteroConv({
+                etype: pyg.nn.GATConv(h_feats, h_feats // n_heads, n_heads)
+                for etype in etypes}))
+
+        self.layers.append(pyg.nn.HeteroConv({
+            etype: pyg.nn.GATConv(h_feats, h_feats // n_heads, n_heads)
+            for etype in etypes}))
+        self.dropout = nn.Dropout(dropout)
+        self.linear = nn.Linear(h_feats, num_classes)
+
+    def forward(self, batch):
+        h = batch.collect('x')
+        e_idx_dict = batch.collect('edge_index')
+        for layer_i, layer in enumerate(self.layers):
+            h = layer(h, e_idx_dict)
+            if layer_i != len(self.layers) - 1:
+                h = F.leaky_relu(h)
+                h = self.dropout(h)
+        return self.linear(h['paper'])
+
+
 class RGAT(torch.nn.Module):
     def __init__(self, backend, device, graph, **model_kwargs):
         super().__init__()
         self.backend = backend.lower()
-        if backend.lower() == "dgl":
+        if self.backend == "dgl":
             check_dgl_available()
             etypes = graph.etypes
             self.model = RGAT_DGL(etypes=etypes, **model_kwargs)
-        elif backend.lower() in ['pyg', 'glt']:
+        elif self.backend in ['pyg', 'glt']:
             # GLT is using the same model as PyG
             check_pyg_available()
-            raise NotImplementedError()
+            etypes = graph.edge_types
+            self.model = RGAT_PyG(etypes=etypes, **model_kwargs)
         else:
             assert False, "Unrecognized backend " + backend
 
@@ -222,14 +271,17 @@ class RGAT(torch.nn.Module):
         self.layers = self.model.layers
 
     def forward(self, batch, device, features):
-        # a general method to get the batches and move them to the corresponding device
-        batch = self.model.extract_graph_structure(batch, device)
+        if self.backend == "dgl":
+            # a general method to get the batches and move them to the corresponding device
+            batch = self.model.extract_graph_structure(batch, device)
 
-        # a general method to fetch the features given the sampled blocks
-        # and move them to corresponding device
-        batch_inputs, batch_labels = self.model.extract_inputs_and_outputs(
-            sampled_subgraph=batch,
-            device=device,
-            features=features,
-        )
-        return self.model.forward(batch, batch_inputs), batch_labels
+            # a general method to fetch the features given the sampled blocks
+            # and move them to corresponding device
+            batch_inputs, batch_labels = self.model.extract_inputs_and_outputs(
+                sampled_subgraph=batch,
+                device=device,
+                features=features,
+            )
+            return self.model.forward(batch, batch_inputs), batch_labels
+        else:
+            return self.model.forward(batch), batch['paper'].y
