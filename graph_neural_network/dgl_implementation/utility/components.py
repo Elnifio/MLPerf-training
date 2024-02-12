@@ -135,7 +135,7 @@ def glorot(value):
             glorot(v)
 
 
-class GATPatchedDGL(dgl.nn.pytorch.GATConv):
+class GATPatched(dgl.nn.pytorch.GATConv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
