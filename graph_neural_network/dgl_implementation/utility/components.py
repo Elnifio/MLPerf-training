@@ -79,7 +79,9 @@ def build_graph(graph_structure, backend, features=None):
         raise NotImplementedError()
     elif backend.lower() == "pyg":
         check_pyg_available()
-        data = pyg.HeteroData({k:torch.cat((v[0].reshape(1, -1), v[1].reshape(1, -1))) for k,v in graph_structure.edge_dict()})
+        data = pyg.data.HeteroData()
+        for k, v in graph_structure.edge_dict.items():
+            data[k].edge_index = torch.cat((v[0].reshape(1, -1), v[1].reshape(1, -1)))
         predict_node_type = "paper"
 
         if features is not None:
@@ -91,7 +93,7 @@ def build_graph(graph_structure, backend, features=None):
         data["cites"].edge_index = pyg.utils.remove_self_loops(data["cites"].edge_index)
         data["cites"].edge_index = pyg.utils.add_self_loops(data["cites"].edge_index)
         data["paper"].y = graph_structure.label
-    
+        print(data)
         return data       
     else:
         assert False, "Unrecognized backend " + backend
