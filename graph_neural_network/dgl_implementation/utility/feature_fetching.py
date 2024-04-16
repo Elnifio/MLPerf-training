@@ -41,6 +41,14 @@ class IGBHeteroGraphStructure:
         self.full_num_trainable_nodes = (227130858 if num_classes != 2983 else 157675969)
         self.train_indices, self.val_indices = self.get_train_val_test_indices()
 
+        self.num_nodes = {
+            "full": {'paper': 269346174, 'author': 277220883, 'institute': 26918, 'fos': 712960, 'journal': 49052, 'conference': 4547},
+            "small": {'paper': 1000000, 'author': 1926066, 'institute': 14751, 'fos': 190449, 'journal': 15277, 'conference': 1215},
+            "medium": {'paper': 10000000, 'author': 15544654, 'institute': 23256, 'fos': 415054, 'journal': 37565, 'conference': 4189},
+            "large": {'paper': 100000000, 'author': 116959896, 'institute': 26524, 'fos': 649707, 'journal': 48820, 'conference': 4490},
+            "tiny": {'paper': 100000, 'author': 357041, 'institute': 8738, 'fos': 84220, 'journal': 8101, 'conference': 398}
+        }[self.dataset_size]
+
     def load_edge_dict(self):
         mmap_mode = None if self.in_memory else "r"
         
@@ -108,6 +116,14 @@ class IGBHeteroGraphStructure:
         )
 
         paper_cites_paper = edge_dict[("paper", 'cites', 'paper')]
+
+        self_loop = torch.arange(self.num_nodes['paper'])
+        mask = paper_cites_paper[0] != paper_cites_paper[1]
+
+        paper_cites_paper = (
+            torch.cat((paper_cites_paper[0][mask], self_loop.clone())),
+            torch.cat((paper_cites_paper[1][mask], self_loop.clone()))
+        )
 
         edge_dict[("paper", 'cites', 'paper')] = (
             torch.cat((paper_cites_paper[0], paper_cites_paper[1])),
