@@ -29,7 +29,19 @@ class PyGSampler(dgl.dataloading.Sampler):
         previous_edges = {}
         previous_seed_nodes = seed_nodes
         input_nodes = seed_nodes
-        for fanout in reversed(self.fanouts):
+
+        device = None
+        for key in seed_nodes:
+            device = seed_nodes[key].device
+
+        not_sampled = {
+            ntype: torch.ones([g.num_nodes(ntype)], dtype=torch.bool, device=device) for ntype in g.ntypes
+        }
+
+        for fanout in reversed(self.fanouts):            
+            for node_type in seed_nodes:
+                not_sampled[node_type][seed_nodes[node_type]] = 0
+
             # Sample a fixed number of neighbors of the current seed nodes.
             sg = g.sample_neighbors(seed_nodes, fanout)
 
@@ -38,13 +50,18 @@ class PyGSampler(dgl.dataloading.Sampler):
             temp = dgl.to_block(sg, previous_seed_nodes, include_dst_in_src=False)
             seed_nodes = temp.srcdata[dgl.NID]
 
+            # GLT/PyG does not sample again on previously-sampled nodes
+            # we mimic this behavior here
+            for node_type in g.ntypes:
+                seed_nodes[node_type] = seed_nodes[node_type][not_sampled[node_type][seed_nodes[node_type]]]
+
             # We add all previously accumulated edges to this subgraph
             for etype in previous_edges:
                 sg.add_edges(*previous_edges[etype], etype=etype)
 
             # This subgraph now contains all its new edges 
             # and previously accumulated edges
-            # so we add the 
+            # so we add them
             previous_edges = {}
             for etype in sg.etypes:
                 previous_edges[etype] = sg.edges(etype=etype)
